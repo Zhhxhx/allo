@@ -161,6 +161,12 @@ def _compile(directory, tools, entry, kernel):
     return top
 
 
+def _iverilog(directory, tools, phase, *arguments):
+    ivl_path = os.environ.get("IVERILOG_IVL_PATH")
+    ivl = ["-B", ivl_path] if ivl_path else []
+    _run(directory, phase, [tools["iverilog"], *ivl, "-g2012", *arguments])
+
+
 def _check_rtl(directory, tools, entry, kernel, vectors, width=32, ieee_nan=False):
     top = _compile(directory, tools, entry, kernel)
     digits = width // 4
@@ -170,28 +176,22 @@ def _check_rtl(directory, tools, entry, kernel, vectors, width=32, ieee_nan=Fals
         ),
         encoding="utf-8",
     )
-    ivl_path = os.environ.get("IVERILOG_IVL_PATH")
-    ivl = ["-B", ivl_path] if ivl_path else []
     defines = [f"-DDUT={top}", f"-DCOUNT={len(vectors)}", f"-DINPUT_BITS={width}"]
     if entry == "proc":
         defines.append("-DPROC")
     if ieee_nan:
         defines.append("-DIEEE_NAN")
-    _run(
+    _iverilog(
         directory,
+        tools,
         "iverilog",
-        [
-            tools["iverilog"],
-            *ivl,
-            "-g2012",
-            "-s",
-            "compare_tb",
-            *defines,
-            "-o",
-            "compare.vvp",
-            FIXTURES / "compare_tb.sv",
-            f"{top}.v",
-        ],
+        "-s",
+        "compare_tb",
+        *defines,
+        "-o",
+        "compare.vvp",
+        FIXTURES / "compare_tb.sv",
+        f"{top}.v",
     )
     output = _run(directory, "rtl-sim", [tools["vvp"], "compare.vvp"])
     counters = re.search(r"^COMPARE compared=(\d+) mismatches=(\d+)$", output, re.M)
@@ -399,3 +399,84 @@ def test_dslx_rtl_opentpu(
     native = runpy.run_path(str(snapshot / "native_arithmetic.py"))
     assert native["ftz"] is helper.ftz
     _check_rtl(tmp_path, rtl_tools, entry, native[operator], vectors)
+
+
+def test_dslx_rtl_ram_binding(rtl_tools, tmp_path):
+    from types import SimpleNamespace
+
+    from allo.backend.dslx.lowering.core_ram_rtl import wrap_ram_rtl
+
+    case = {
+        "entry": "ram",
+        "top": "ram_check",
+        "backend": inspect.getfile(wrap_ram_rtl),
+    }
+    (tmp_path / "case.json").write_text(json.dumps(case) + "\n", encoding="utf-8")
+    _run(
+        tmp_path,
+        "ram-dslx-to-ir",
+        [
+            rtl_tools["ir_converter_main"],
+            f"--dslx_stdlib_path={rtl_tools['stdlib']}",
+            "--top=ram_check",
+            FIXTURES / "ram_datapath.x",
+        ],
+        output="ram_check.ir",
+    )
+    _run(
+        tmp_path,
+        "ram-xls-opt",
+        [rtl_tools["opt_main"], "ram_check.ir"],
+        output="ram_check.opt.ir",
+    )
+    datapath = _run(
+        tmp_path,
+        "ram-xls-codegen",
+        [
+            rtl_tools["codegen_main"],
+            "--generator=pipeline",
+            "--pipeline_stages=4",
+            "--delay_model=unit",
+            "--reset=clear",
+            "--use_system_verilog=false",
+            "--module_name=ram_check_datapath",
+            "ram_check.opt.ir",
+        ],
+        output="ram_check_datapath.v",
+    )
+    ports = [
+        SimpleNamespace(name="command", width=20, direction="in"),
+        SimpleNamespace(name="answer", width=16, direction="out"),
+    ]
+    rams = [
+        SimpleNamespace(
+            name=name,
+            request=f"{name}_req",
+            response=f"{name}_resp",
+            width=16,
+            address_width=2,
+            size=size,
+            initial=initial,
+        )
+        for name, size, initial in (
+            ("first", 3, (0x0123, -2, 0xBEEF)),
+            ("second", 4, -1),
+        )
+    ]
+    rtl = wrap_ram_rtl(datapath, "ram_check", ports, rams, reset="clear")
+    assert rtl.startswith(datapath)
+    (tmp_path / "ram_check.v").write_text(rtl, encoding="utf-8")
+    _iverilog(
+        tmp_path,
+        rtl_tools,
+        "ram-iverilog",
+        "-s",
+        "ram_tb",
+        "-o",
+        "ram.vvp",
+        FIXTURES / "ram_tb.sv",
+        "ram_check.v",
+    )
+    output = _run(tmp_path, "ram-sim", [rtl_tools["vvp"], "ram.vvp"])
+    assert "RAM handshake and reset passed" in output
+    _mark(tmp_path, "passed")
