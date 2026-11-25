@@ -171,3 +171,50 @@ Conclusion
 ----------
 This example illustrates the process of defining a GEMM kernel using the Allo ADL and generating XLS code 
 for the ASIC flow. The approach supports the software synthesis modes which is wonderful for quick verifications and debugging.
+
+Compiling through DSLX
+----------------------
+
+Use the schedule's MLIR module and top-level symbol to select a DSLX entry.
+The example below builds a two-input function and emits Verilog in
+``xls_output``. Put the XLS release binaries and their matching DSLX standard
+library on the tool path. The RTL tests use XLS v0.0.0-11232-g91bf81770.
+
+.. code-block:: python
+
+   import allo
+   from allo.ir.types import int32
+   from allo.backend.dslx import DslxFunctionModule, DslxProcModule
+
+   def subtract(left: int32, right: int32) -> int32:
+       return left - right
+
+   schedule = allo.customize(subtract)
+   fn = DslxFunctionModule(schedule.module, schedule.top_func_name)
+   fn.to_ir(verbose=False)
+   fn.opt(verbose=False)
+   fn.to_vlog(verbose=False, pipeline_stages=3, delay_model="unit")
+
+A function produces a value from its arguments. Its reachable helper functions
+are compiled together. The function lowerer supports integer scalars, binary32
+addition and multiplication, static arrays and bounded loops. It diagnoses
+unsupported operations and externally visible writes. Floating-point ports
+carry the raw binary32 encoding.
+
+To expose scalar arguments and the return value as blocking channels, construct
+``DslxProcModule(schedule.module, schedule.top_func_name)`` and use the same
+three calls. To inspect either module before invoking XLS, call ``codegen()``.
+A scheduled dataflow top connects its concurrent callees with FIFOs of the
+declared depth. Its external stream ports use data, valid and ready signals.
+The generated RTL binds an actor's large internal memories to synchronous
+storage. For FPGA targets that preserve statically initialized RAM across a
+control restart, pass ``preserve_static_memories=True`` to ``to_vlog()``.
+
+Run the generic RTL and XLS C++ regressions locally from the repository root.
+The command requires an installed Allo environment, XLS tools and Icarus
+Verilog. The optional OpenTPU integration also uses Verilator, the frozen
+snapshot, reference RTL and vector files.
+
+.. code-block:: bash
+
+   XLS_BIN=/path/to/xls-release bash scripts/test-dslx-rtl.sh -k 'not opentpu'

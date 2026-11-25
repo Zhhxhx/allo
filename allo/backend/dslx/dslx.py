@@ -177,6 +177,7 @@ class DslxProcModule(_DslxModule):
     def __init__(self, mod, top_func_name):
         super().__init__(mod, top_func_name)
         self.network = None
+        self._emitted = False
 
     def codegen(self):
         from .lowering.proc_dispatch import emit_proc_module
@@ -196,13 +197,18 @@ class DslxProcModule(_DslxModule):
         module_name=None,
         flop_inputs=True,
         flop_outputs=True,
+        preserve_static_memories=False,
     ):
         from .lowering.core_ram_rtl import wrap_ram_rtl
 
-        if not hasattr(self, "_emitted"):
+        if not self._emitted:
             self.codegen()
         name = module_name or function_name(self.func)
         bind_rams = self.network is not None and bool(self.network.rams)
+        if pipeline_stages is None and clock_period_ps is None and self.network is None:
+            if any(mlir_ir.MemRefType.isinstance(t) for t in self.func_op.type.inputs):
+                # Memory-channel procs need separate request and response stages.
+                pipeline_stages = 3
         flags = ["--fifo_module=", "--materialize_internal_fifos"]
         if not flop_inputs:
             flags.append("--noflop_inputs")
@@ -219,7 +225,8 @@ class DslxProcModule(_DslxModule):
         )
         if bind_rams:
             result.stdout = wrap_ram_rtl(
-                result.stdout, name, self.network.ports, self.network.rams, reset
+                result.stdout, name, self.network.ports, self.network.rams, reset,
+                preserve_static_memories=preserve_static_memories,
             )
             self._path(".v").write_text(result.stdout)
         return result
