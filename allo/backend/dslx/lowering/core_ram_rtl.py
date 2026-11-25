@@ -60,7 +60,7 @@ def _initial_word(ram, index):
     return function, f"{name}({address_slice})"
 
 
-def _instantiate_ram(ram, index, bridge, reset):
+def _instantiate_ram(ram, index, bridge, reset, preserve_static_memories):
     if ram.width < 1 or ram.address_width < 1:
         raise ValueError(f"RAM {ram.name} requires positive data and address widths")
     if ram.size < 1 or ram.size > (1 << ram.address_width):
@@ -68,8 +68,10 @@ def _instantiate_ram(ram, index, bridge, reset):
 
     function, initial = _initial_word(ram, index)
     request, response = _pin(ram.request), _pin(ram.response)
+    retain = int(preserve_static_memories and ram.is_static)
     binding = f"""  {bridge} #(
-    .DATA_WIDTH({ram.width}), .ADDR_WIDTH({ram.address_width}), .DEPTH({ram.size})
+    .DATA_WIDTH({ram.width}), .ADDR_WIDTH({ram.address_width}), .DEPTH({ram.size}),
+    .RETAIN_WRITES({retain})
   ) allo_ram_{index} (
     .clk(clk), .reset({reset}),
     .request({request}), .request_valid({request}_vld), .request_ready({request}_rdy),
@@ -79,12 +81,22 @@ def _instantiate_ram(ram, index, bridge, reset):
     return "\n".join(part for part in (function, binding) if part)
 
 
-def wrap_ram_rtl(rtl: str, design_name: str, external_ports, rams, reset="rst") -> str:
+def wrap_ram_rtl(
+    rtl: str,
+    design_name: str,
+    external_ports,
+    rams,
+    reset="rst",
+    *,
+    preserve_static_memories=False,
+) -> str:
     """Expose the datapath's external channels and bind each RAM request/response.
 
     Channel names in the input descriptors are DSLX names. The corresponding
     XLS RTL ports have a leading underscore and valid/ready suffixes. Each RAM
     accepts {is_write, address, value}; only reads produce responses.
+    With static preservation, backing RAMs start from the declared initial
+    image at FPGA power-up and retain written words across control resets.
     """
     datapath = f"{design_name}_datapath"
     if not re.search(rf"\bmodule\s+{re.escape(datapath)}\s*\(", rtl):
@@ -108,7 +120,9 @@ def wrap_ram_rtl(rtl: str, design_name: str, external_ports, rams, reset="rst") 
         for pin, _, width in (*request, *response):
             declarations.append(f"  wire{_range(width)} {pin};")
             connections.append(f".{pin}({pin})")
-        bindings.append(_instantiate_ram(ram, index, bridge, reset))
+        bindings.append(
+            _instantiate_ram(ram, index, bridge, reset, preserve_static_memories)
+        )
 
     port_list = ",\n  ".join(port_decls)
     wires = "\n".join(declarations)
@@ -132,7 +146,8 @@ _RAM_BRIDGE = """
 module ALLO_RAM_BRIDGE #(
   parameter integer DATA_WIDTH = 32,
   parameter integer ADDR_WIDTH = 1,
-  parameter integer DEPTH = 1
+  parameter integer DEPTH = 1,
+  parameter RETAIN_WRITES = 1'b0
 )(
   input wire clk,
   input wire reset,
@@ -161,7 +176,11 @@ module ALLO_RAM_BRIDGE #(
   assign response = read_written ? read_data : read_initial;
 
   // The write array and its synchronous output register have no reset path.
-  // Reset discards written-word tags and selects the immutable initial image.
+  // Static RAMs retain written-word tags across a control reset when enabled.
+  initial begin
+    if (RETAIN_WRITES)
+      written = {DEPTH{1'b0}};
+  end
   always @(posedge clk) begin
     if (write_enable)
       memory[address] <= request[DATA_WIDTH-1:0];
@@ -172,7 +191,8 @@ module ALLO_RAM_BRIDGE #(
   always @(posedge clk) begin
     if (reset) begin
       response_valid <= 1'b0;
-      written <= {DEPTH{1'b0}};
+      if (!RETAIN_WRITES)
+        written <= {DEPTH{1'b0}};
     end else begin
       if (write_enable)
         written[address] <= 1'b1;

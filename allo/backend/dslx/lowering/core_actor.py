@@ -36,6 +36,7 @@ class ActorRAM:
     width: int
     size: int
     initial: int | tuple[int, ...]
+    is_static: bool = False
 
     @property
     def address_width(self):
@@ -223,7 +224,7 @@ class ActorLowerer:
             return literal(typ, frozen)
         return self._read(step, self._reg(instance, value))
 
-    def _storage(self, typ, initial=0, *, port=None):
+    def _storage(self, typ, initial=0, *, port=None, is_static=False):
         ref = ir.MemRefType(typ)
         shape = tuple(ref.shape)
         if any(dim <= 0 for dim in shape):
@@ -251,7 +252,11 @@ class ActorLowerer:
             )
         if size >= 256 or space is not None:
             ram = ActorRAM(
-                f"{self.symbol}_ram{len(self.rams)}", element_width, size, initial
+                f"{self.symbol}_ram{len(self.rams)}",
+                element_width,
+                size,
+                initial,
+                is_static,
             )
             self.rams.append(ram)
             storage.ram = ram
@@ -285,7 +290,7 @@ class ActorLowerer:
             initial = integer(dense.get_splat_value()) % modulus
         else:
             initial = tuple(int(x) % modulus for x in dense)
-        storage = self._storage(typ, initial)
+        storage = self._storage(typ, initial, is_static="static" in decl.attributes)
         self.global_memories[name] = storage
         return storage
 

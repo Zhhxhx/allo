@@ -400,7 +400,9 @@ def test_dslx_rtl_opentpu(
     _check_rtl(tmp_path, rtl_tools, entry, native[operator], vectors)
 
 
-def test_dslx_rtl_ram_binding(rtl_tools, tmp_path):
+@pytest.mark.parametrize("preserve_static", (False, True))
+def test_dslx_rtl_ram_binding(rtl_tools, tmp_path, preserve_static):
+    from allo.backend.dslx.lowering.core_actor import ActorRAM
     from allo.backend.dslx.lowering.core_ram_rtl import wrap_ram_rtl
 
     case = {
@@ -446,21 +448,17 @@ def test_dslx_rtl_ram_binding(rtl_tools, tmp_path):
         SimpleNamespace(name="answer", width=16, direction="out"),
     ]
     rams = [
-        SimpleNamespace(
-            name=name,
-            request=f"{name}_req",
-            response=f"{name}_resp",
-            width=16,
-            address_width=2,
-            size=size,
-            initial=initial,
-        )
-        for name, size, initial in (
-            ("first", 3, (0x0123, -2, 0xBEEF)),
-            ("second", 4, -1),
-        )
+        ActorRAM("first", 16, 3, (0x0123, -2, 0xBEEF), is_static=True),
+        ActorRAM("second", 16, 4, -1),
     ]
-    rtl = wrap_ram_rtl(datapath, "ram_check", ports, rams, reset="clear")
+    rtl = wrap_ram_rtl(
+        datapath,
+        "ram_check",
+        ports,
+        rams,
+        reset="clear",
+        preserve_static_memories=preserve_static,
+    )
     assert rtl.startswith(datapath)
     (tmp_path / "ram_check.v").write_text(rtl, encoding="utf-8")
     _iverilog(
@@ -469,6 +467,8 @@ def test_dslx_rtl_ram_binding(rtl_tools, tmp_path):
         "ram-iverilog",
         "-s",
         "ram_tb",
+        "-P",
+        f"ram_tb.PRESERVE_STATIC={int(preserve_static)}",
         "-o",
         "ram.vvp",
         FIXTURES / "ram_tb.sv",

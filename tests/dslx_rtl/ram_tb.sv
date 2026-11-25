@@ -1,7 +1,7 @@
 // Copyright Allo authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-module ram_tb;
+module ram_tb #(parameter PRESERVE_STATIC = 0);
   timeunit 1ns;
   timeprecision 1ps;
 
@@ -109,7 +109,7 @@ module ram_tb;
     repeat (3) @(negedge clk);
     clear = 0;
     check_idle();
-    check_read(1'b0, 2'd1, 16'hfffe);
+    check_read(1'b0, 2'd1, PRESERVE_STATIC ? 16'h12ca : 16'hfffe);
     check_read(1'b1, 2'd1, 16'hffff);
     check_read(1'b0, 2'd0, 16'h0123);
     $display("RAM handshake and reset passed");
