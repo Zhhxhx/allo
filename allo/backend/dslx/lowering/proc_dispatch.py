@@ -6,6 +6,7 @@
 from math import prod
 
 from allo._mlir import ir
+from allo._mlir import ir
 from allo._mlir.dialects import func as func_d
 
 
@@ -91,8 +92,13 @@ def emit_proc_module(module, top):
 
         graph = build_network(module, top.name.value)
         return graph.source, graph
+    # Shaped legacy proc buffers expose address and data channels for each RAM.
     if (
         len(top.type.results) == 1
+        and not any(
+            ir.ShapedType.isinstance(typ)
+            for typ in (*top.type.inputs, *top.type.results)
+        )
         and not any(
             op.operation.name == "memref.get_global"
             for fn in _reachable(module, top)

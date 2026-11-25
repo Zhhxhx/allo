@@ -477,3 +477,54 @@ def test_dslx_rtl_ram_binding(rtl_tools, tmp_path):
     output = _run(tmp_path, "ram-sim", [rtl_tools["vvp"], "ram.vvp"])
     assert "RAM handshake and reset passed" in output
     _mark(tmp_path, "passed")
+
+
+def add_vectors_i32(left: int32[4], right: int32[4], result: int32[4]):
+    for i in range(4):
+        result[i] = left[i] + right[i]
+
+
+@pytest.mark.parametrize("kernel, comparisons", [(dot_i32, 6), (add_vectors_i32, 24)])
+def test_dslx_rtl_legacy_memref_abi(
+    kernel, comparisons, rtl_tools, tmp_path, monkeypatch
+):
+    """Ranked proc buffers continue to use the original external RAM channels."""
+    xls_bin = rtl_tools["ir_converter_main"].parent
+    monkeypatch.setenv("PATH", f"{xls_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    top = kernel.__name__
+    case = {
+        "entry": "legacy-proc",
+        "top": top,
+        "backend": inspect.getfile(DslxProcModule),
+    }
+    (tmp_path / "case.json").write_text(json.dumps(case) + "\n", encoding="utf-8")
+    module = allo.customize(kernel).module
+    proc = DslxProcModule(str(module), top)
+    proc._out_dir = str(tmp_path)
+    _mark(tmp_path, "legacy-dslx-to-ir")
+    proc.to_ir(verbose=False)
+    _mark(tmp_path, "legacy-xls-opt")
+    proc.opt(verbose=False)
+    _mark(tmp_path, "legacy-xls-codegen")
+    proc.to_vlog(verbose=False, delay_model="unit", pipeline_stages=3)
+
+    defines = [f"-DDUT={top}"]
+    if kernel is dot_i32:
+        defines.append("-DTEST_DOT")
+    _iverilog(
+        tmp_path,
+        rtl_tools,
+        "legacy-iverilog",
+        "-s",
+        "legacy_memref_tb",
+        *defines,
+        "-o",
+        "legacy.vvp",
+        FIXTURES / "legacy_memref_tb.sv",
+        f"{top}.v",
+    )
+    output = _run(tmp_path, "legacy-sim", [rtl_tools["vvp"], "legacy.vvp"])
+    assert f"COMPARE compared={comparisons} mismatches=0" in output
+    case.update(compared=comparisons, mismatches=0)
+    (tmp_path / "comparison.json").write_text(json.dumps(case) + "\n", encoding="utf-8")
+    _mark(tmp_path, "passed")
