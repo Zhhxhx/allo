@@ -13,7 +13,7 @@ from .mlir_to_dslx_fn import dslx_type, scalar_expression
 def prepare_actor_module(module):
     """Normalize an independent copy to MLIR's scalar control-flow dialect."""
     with module.operation.context:
-        result = ir.Module.parse(str(module))
+        result = ir.Module.parse(module.operation.get_asm(enable_debug_info=True))
         passes = PassManager.parse(
             "builtin.module(convert-linalg-to-loops,lower-affine,"
             "convert-scf-to-cf,canonicalize,mem2reg)"
@@ -121,7 +121,8 @@ def constant(value):
 
 
 def tuple_expr(values):
-    return "(" + "".join(f"{value}, " for value in values) + ")"
+    entries = ", ".join(values)
+    return f"({entries},)" if len(values) == 1 else f"({entries})"
 
 
 def bit_expression(op, value):
@@ -154,7 +155,6 @@ class ActorLowerer:
     """
 
     def __init__(self, module, function, symbol, ports):
-        self.module = module
         self.function = function
         self.symbol = symbol
         self._pc_type = f"{symbol}Pc"
@@ -224,20 +224,32 @@ class ActorLowerer:
         ref = ir.MemRefType(typ)
         shape = tuple(ref.shape)
         if any(dim <= 0 for dim in shape):
-            raise NotImplementedError(f"Actor storage requires positive static dimensions: {typ}")
+            raise NotImplementedError(
+                f"Actor storage requires positive static dimensions: {typ}"
+            )
         element_width = width(ref.element_type)
         element_type = dslx_type(ref.element_type)
         storage = Storage(shape, element_type, port=port)
         size = prod(shape)
         if port is not None:
             if len(self.ports[port].names) != size:
-                raise ValueError(f"Argument {port} of {self.symbol} needs {size} channel lanes")
+                raise ValueError(
+                    f"Argument {port} of {self.symbol} needs {size} channel lanes"
+                )
             return storage
         space = ref.memory_space
-        if space is not None and ir.StringAttr.isinstance(space) and space.value.startswith("stream:"):
-            raise NotImplementedError("Actor-local stream allocation needs a dataflow producer and consumer")
+        if (
+            space is not None
+            and ir.StringAttr.isinstance(space)
+            and space.value.startswith("stream:")
+        ):
+            raise NotImplementedError(
+                "Actor-local stream allocation needs a dataflow producer and consumer"
+            )
         if size >= 256 or space is not None:
-            ram = ActorRAM(f"{self.symbol}_ram{len(self.rams)}", element_width, size, initial)
+            ram = ActorRAM(
+                f"{self.symbol}_ram{len(self.rams)}", element_width, size, initial
+            )
             self.rams.append(ram)
             storage.ram = ram
             return storage
@@ -287,7 +299,9 @@ class ActorLowerer:
             if ir.MemRefType.isinstance(typ):
                 fail(func, "Returning memrefs from actor helpers is unsupported")
             returned.append(self._new_field(dslx_type(typ)))
-        instance = FunctionInstance(func, next(iter(blocks.values())), return_pc, tuple(returned), blocks)
+        instance = FunctionInstance(
+            func, next(iter(blocks.values())), return_pc, tuple(returned), blocks
+        )
         self._instances[key] = instance
 
         for arg, storage in zip(func.arguments, memories, strict=True):
@@ -313,7 +327,9 @@ class ActorLowerer:
         for i, idx in enumerate(indices):
             value = constant(idx)
             if value is not None and not 0 <= value < storage.shape[i]:
-                raise ValueError(f"Static memref index {value} is out of bounds for {storage.shape}")
+                raise ValueError(
+                    f"Static memref index {value} is out of bounds for {storage.shape}"
+                )
             if storage.shape[i] == 1:
                 continue
             stride = prod(storage.shape[i + 1 :])
@@ -366,9 +382,15 @@ class ActorLowerer:
         storage = instance.memories[memref]
         ty = storage.element_type
         if storage.port is not None:
-            lanes = self._port_lanes(instance, step, storage, indices, "in" if load else "out", op)
+            lanes = self._port_lanes(
+                instance, step, storage, indices, "in" if load else "out", op
+            )
             if load:
-                self._write(step, self._reg(instance, op.results[0]), self._receive(step, lanes, ty))
+                self._write(
+                    step,
+                    self._reg(instance, op.results[0]),
+                    self._receive(step, lanes, ty),
+                )
             else:
                 self._send(step, lanes, ty, self._value(instance, step, operands[0]))
         elif storage.ram:
@@ -387,7 +409,9 @@ class ActorLowerer:
         else:
             state = storage.state
             size = prod(storage.shape)
-            addr, _ = self._address(instance, step, storage, indices, max(1, (size - 1).bit_length()))
+            addr, _ = self._address(
+                instance, step, storage, indices, max(1, (size - 1).bit_length())
+            )
             if load:
                 data = self._read(step, state)
                 if size != 1:
@@ -422,8 +446,12 @@ class ActorLowerer:
             return
 
         true_size = len(successors[0].arguments)
-        yes = self._assignments(instance, step, op, successors[0], operands[1 : 1 + true_size])
-        no = self._assignments(instance, step, op, successors[1], operands[1 + true_size :])
+        yes = self._assignments(
+            instance, step, op, successors[0], operands[1 : 1 + true_size]
+        )
+        no = self._assignments(
+            instance, step, op, successors[1], operands[1 + true_size :]
+        )
         for reg in dict.fromkeys([*yes, *no]):
             true_val = yes[reg] if reg in yes else self._read(step, reg)
             false_val = no[reg] if reg in no else self._read(step, reg)
@@ -451,12 +479,18 @@ class ActorLowerer:
         self._write(step, callee.return_pc, self._pc(continuation))
         for arg, actual, storage in zip(func.arguments, args, bindings, strict=True):
             if storage is None:
-                self._write(step, self._reg(callee, arg), self._value(instance, step, actual))
+                self._write(
+                    step, self._reg(callee, arg), self._value(instance, step, actual)
+                )
         step.target = self._pc(callee.entry)
         if fresh:
             self._compile(callee)
         for actual, result in zip(op.results, callee.returned, strict=True):
-            self._write(continuation, self._reg(instance, actual), self._read(continuation, result))
+            self._write(
+                continuation,
+                self._reg(instance, actual),
+                self._read(continuation, result),
+            )
         return continuation
 
     def _compile(self, instance, root=False):
@@ -465,7 +499,12 @@ class ActorLowerer:
             operations = list(block.operations)
             for op in operations:
                 name = op.operation.name
-                if name in ("memref.alloc", "memref.alloca", "memref.get_global", "memref.dealloc"):
+                if name in (
+                    "memref.alloc",
+                    "memref.alloca",
+                    "memref.get_global",
+                    "memref.dealloc",
+                ):
                     continue
                 if name in ("memref.load", "memref.store"):
                     memref = op.operands[0 if name == "memref.load" else 1]
@@ -482,14 +521,23 @@ class ActorLowerer:
                 elif name == "func.return":
                     if root:
                         if len(op.operands):
-                            fail(op, "A dataflow actor returns data through its channel arguments")
+                            fail(
+                                op,
+                                "A dataflow actor returns data through its channel arguments",
+                            )
                         step.target = self._pc(instance.entry)
                     else:
-                        for reg, value in zip(instance.returned, op.operands, strict=True):
+                        for reg, value in zip(
+                            instance.returned, op.operands, strict=True
+                        ):
                             self._write(step, reg, self._value(instance, step, value))
                         step.target = self._read(step, instance.return_pc)
                 elif name in ("cf.br", "cf.cond_br"):
-                    cond = self._value(instance, step, op.operands[0]) if name == "cf.cond_br" else None
+                    cond = (
+                        self._value(instance, step, op.operands[0])
+                        if name == "cf.cond_br"
+                        else None
+                    )
                     self._edge_arguments(instance, step, op, cond)
                 else:
                     if len(op.results) != 1:
@@ -517,8 +565,7 @@ class ActorLowerer:
         pc = self._pc_type
         state = [reg for reg in self._fields if reg.persistent]
         pc_bits = f"uN[{max(1, (len(self._steps) - 1).bit_length())}]"
-        lines = [f"type {pc} = {pc_bits};",
-                 f"struct {typ} {{", f"  pc: {pc},"]
+        lines = [f"type {pc} = {pc_bits};", f"struct {typ} {{", f"  pc: {pc},"]
         lines.extend(f"  {reg.name}: {reg.type}," for reg in state)
         lines += ["}", f"proc {self.symbol} {{"]
 
@@ -526,9 +573,14 @@ class ActorLowerer:
         for index, direction in sorted(self.directions.items()):
             arg = self.function.arguments[index]
             elem = ir.MemRefType(arg.type).element_type
-            ports.extend(f"{name}: chan<{dslx_type(elem)}> {direction}" for name in self.ports[index].names)
+            ports.extend(
+                f"{name}: chan<{dslx_type(elem)}> {direction}"
+                for name in self.ports[index].names
+            )
         for ram in self.rams:
-            ports.append(f"{ram.request}: chan<uN[{1 + ram.address_width + ram.width}]> out")
+            ports.append(
+                f"{ram.request}: chan<uN[{1 + ram.address_width + ram.width}]> out"
+            )
             ports.append(f"{ram.response}: chan<uN[{ram.width}]> in")
         port_names = [port.split(":", 1)[0] for port in ports]
         lines.extend(f"  {port};" for port in ports)
@@ -542,17 +594,23 @@ class ActorLowerer:
         lines.extend(f"    {reg.name}: {reg.initial}," for reg in state)
         lines += ["  } }", f"  next(state: {typ}) {{"]
         for step in self._steps:
-            lines.append(f"    let {step.active} = state.pc == {self._pc(step)};")
+            if step.channel_access:
+                lines.append(f"    let {step.active} = state.pc == {self._pc(step)};")
         for name, receives in self._receives.items():
             predicate = " || ".join(pred for pred, _ in receives)
             ty = receives[0][1]
-            lines.append(f"    let (_, recv_{name}) = recv_if(join(), {name}, {predicate}, {ty}:0);")
+            lines.append(
+                f"    let (_, recv_{name}) = recv_if(join(), {name}, {predicate}, {ty}:0);"
+            )
         for step in self._steps:
             lines.extend(f"    {line}" for line in step.lines)
         for name, sends in self._sends.items():
             predicate = " || ".join(pred for pred, _, _ in sends)
-            data = " | ".join(f"(if {pred} {{ {value} }} else {{ {ty}:0 }})" for pred, ty, value in sends)
-            lines.append(f"    let _ = send_if(join(), {name}, {predicate}, {data});")
+            data = " | ".join(
+                f"(if {pred} {{ {value} }} else {{ {ty}:0 }})"
+                for pred, ty, value in sends
+            )
+            lines.append(f"    send_if(join(), {name}, {predicate}, {data});")
         lines += [f"    {typ} {{", "      pc: match state.pc {"]
         for step in self._steps:
             lines.append(f"        {pc_bits}:{step.number} => {step.target},")
@@ -574,10 +632,11 @@ class ActorLowerer:
         args = []
         for index, arg in enumerate(self.function.arguments):
             if index not in self.ports or not ir.MemRefType.isinstance(arg.type):
-                fail(self.function, "Dataflow actor arguments must bind to channel lanes")
+                fail(
+                    self.function, "Dataflow actor arguments must bind to channel lanes"
+                )
             args.append(self._storage(arg.type, port=index))
         self._compiling = []
         root, _ = self._new_instance(self.function, tuple(args))
         self._compile(root, root=True)
         return self._render(root.entry)
-
