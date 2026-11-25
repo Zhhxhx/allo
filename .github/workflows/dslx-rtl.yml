@@ -1,0 +1,122 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Allo XLS RTL
+
+on:
+  push:
+    paths:
+      - ".github/workflows/dslx-rtl.yml"
+      - "allo/backend/dslx/**"
+      - "allo/backend/xls*.py"
+      - "tests/dslx_rtl/**"
+      - "tests/test_dslx*.py"
+      - "tests/test_xls.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/dslx-rtl.yml"
+      - "allo/backend/dslx/**"
+      - "allo/backend/xls*.py"
+      - "tests/dslx_rtl/**"
+      - "tests/test_dslx*.py"
+      - "tests/test_xls.py"
+
+permissions:
+  contents: read
+
+jobs:
+  xls-rtl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      XLS_VERSION: v0.0.0-11232-g91bf81770
+      NANOBIND_VERSION: "2.15.0"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      ALLO_DSLX_RTL_REQUIRED: "1"
+      NUM_THREADS: "3"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.12"
+
+      - name: Install build and RTL tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            iverilog libedit-dev libffi-dev libxml2-dev libzstd-dev zlib1g-dev
+          python -m pip install "setuptools>=61.0" wheel cmake ninja \
+            "nanobind==$NANOBIND_VERSION" numpy PyYAML
+          xls_dir="xls-$XLS_VERSION-linux-x64"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/google/xls/releases/download/$XLS_VERSION/$xls_dir.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "XLS_BIN=$RUNNER_TEMP/$xls_dir" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/$xls_dir" >> "$GITHUB_PATH"
+          echo "LLVM_BUILD_DIR=$GITHUB_WORKSPACE/externals/llvm-project/build" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/externals/llvm-project/build/bin" >> "$GITHUB_PATH"
+
+      - name: Identify the pinned LLVM submodule
+        id: llvm
+        shell: bash
+        run: echo "commit=$(git -C externals/llvm-project rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore LLVM build
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_BUILD_DIR }}
+          key: xls-rtl-llvm-ubuntu24-${{ runner.arch }}-${{ steps.llvm.outputs.commit }}-py${{ steps.python.outputs.python-version }}-nb${{ env.NANOBIND_VERSION }}-v1
+
+      - name: Build MLIR with Python bindings
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          cmake -S externals/llvm-project/llvm -B "$LLVM_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS=mlir \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+            -DPython3_EXECUTABLE="$(command -v python)"
+          cmake --build "$LLVM_BUILD_DIR" --parallel "$NUM_THREADS"
+
+      - name: Build Allo from the checkout
+        shell: bash
+        run: python -m pip install --no-build-isolation -v -e .
+
+      - name: Verify DSLX RTL and XLS C++ regressions
+        shell: bash
+        run: |
+          python --version
+          llvm-config --version
+          "$XLS_BIN/ir_converter_main" --version
+          "$XLS_BIN/opt_main" --version
+          "$XLS_BIN/codegen_main" --version
+          iverilog -V
+          out="$RUNNER_TEMP/allo-xls-rtl"
+          mkdir -p "$out"
+          python -m pytest -v tests/test_dslx*.py tests/test_xls.py -k 'not opentpu' \
+            --basetemp "$out/cases" --junitxml "$out/junit.xml"
+
+      - name: Upload RTL regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allo-xls-rtl
+          path: |
+            ${{ runner.temp }}/allo-xls-rtl/junit.xml
+            ${{ runner.temp }}/allo-xls-rtl/cases/**/*.log
+            ${{ runner.temp }}/allo-xls-rtl/cases/**/*.stderr
+            ${{ runner.temp }}/allo-xls-rtl/cases/**/*.json
+            ${{ runner.temp }}/allo-xls-rtl/cases/**/phase.txt

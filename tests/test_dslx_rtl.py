@@ -4,7 +4,6 @@
 """Compile DSLX through XLS and compare simulated RTL against independent oracles."""
 
 import csv
-import importlib.util
 import inspect
 import json
 import os
@@ -16,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -390,20 +390,17 @@ def test_dslx_rtl_opentpu(
 ):
     snapshot, _, _ = opentpu_paths
     operator, vectors = frozen_vectors
-    spec = importlib.util.spec_from_file_location(
-        "arithmetic", snapshot / "arithmetic.py"
+    helper = ModuleType("arithmetic")
+    helper.__dict__.update(
+        runpy.run_path(str(snapshot / "arithmetic.py"), run_name=helper.__name__)
     )
-    helper = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "arithmetic", helper)
-    spec.loader.exec_module(helper)
     native = runpy.run_path(str(snapshot / "native_arithmetic.py"))
     assert native["ftz"] is helper.ftz
     _check_rtl(tmp_path, rtl_tools, entry, native[operator], vectors)
 
 
 def test_dslx_rtl_ram_binding(rtl_tools, tmp_path):
-    from types import SimpleNamespace
-
     from allo.backend.dslx.lowering.core_ram_rtl import wrap_ram_rtl
 
     case = {
