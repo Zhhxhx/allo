@@ -70,6 +70,7 @@ class Step:
     lines: list[str] = field(default_factory=list)
     values: dict[StateField, str] = field(default_factory=dict)
     target: str = ""
+    channel_access: bool = False
 
     @property
     def active(self):
@@ -310,16 +311,18 @@ class ActorLowerer:
         terms = []
         typ = f"uN[{bits}]"
         for i, idx in enumerate(indices):
-            stride = prod(storage.shape[i + 1 :])
             value = constant(idx)
+            if value is not None and not 0 <= value < storage.shape[i]:
+                raise ValueError(f"Static memref index {value} is out of bounds for {storage.shape}")
+            if storage.shape[i] == 1:
+                continue
+            stride = prod(storage.shape[i + 1 :])
             if value is None:
                 index = f"({self._value(instance, step, idx)} as {typ})"
                 terms.append(f"({index} * {typ}:{stride})" if stride != 1 else index)
             else:
                 fixed += value * stride
         if not terms:
-            if not 0 <= fixed < prod(storage.shape):
-                raise ValueError(f"Static memref access {fixed} is out of bounds for {storage.shape}")
             return literal(typ, fixed), fixed
         if fixed:
             terms.append(literal(typ, fixed % (1 << bits)))
@@ -340,14 +343,16 @@ class ActorLowerer:
             for i, name in enumerate(names)
         ]
 
-    def _receive(self, sources, ty):
+    def _receive(self, step, sources, ty):
+        step.channel_access = True
         values = []
         for name, pred in sources:
             self._receives[name].append((pred, ty))
             values.append(f"(if {pred} {{ recv_{name} }} else {{ {ty}:0 }})")
         return "(" + " | ".join(values) + ")"
 
-    def _send(self, destinations, ty, value):
+    def _send(self, step, destinations, ty, value):
+        step.channel_access = True
         for name, pred in destinations:
             self._sends[name].append((pred, ty, value))
 
@@ -363,20 +368,20 @@ class ActorLowerer:
         if storage.port is not None:
             lanes = self._port_lanes(instance, step, storage, indices, "in" if load else "out", op)
             if load:
-                self._write(step, self._reg(instance, op.results[0]), self._receive(lanes, ty))
+                self._write(step, self._reg(instance, op.results[0]), self._receive(step, lanes, ty))
             else:
-                self._send(lanes, ty, self._value(instance, step, operands[0]))
+                self._send(step, lanes, ty, self._value(instance, step, operands[0]))
         elif storage.ram:
             ram = storage.ram
             addr, _ = self._address(instance, step, storage, indices, ram.address_width)
             request = f"u1:{int(not load)} ++ {addr} ++ "
             request += f"{ty}:0" if load else self._value(instance, step, operands[0])
             request_ty = f"uN[{1 + ram.address_width + ram.width}]"
-            self._send([(ram.request, step.active)], request_ty, request)
+            self._send(step, [(ram.request, step.active)], request_ty, request)
             if load:
                 response = self._new_step()
                 step.target = self._pc(response)
-                data = self._receive([(ram.response, response.active)], ty)
+                data = self._receive(response, [(ram.response, response.active)], ty)
                 self._write(response, self._reg(instance, op.results[0]), data)
                 return response
         else:
@@ -466,14 +471,12 @@ class ActorLowerer:
                     memref = op.operands[0 if name == "memref.load" else 1]
                     storage = instance.memories.get(memref)
                     if storage and (storage.port is not None or storage.ram):
-                        access = self._new_step()
-                        step.target = self._pc(access)
-                        step = self._access(instance, access, op)
-                        continuation = self._new_step()
-                        step.target = self._pc(continuation)
-                        step = continuation
-                    else:
-                        self._access(instance, step, op)
+                        # Compute the channel address from established state before issuing the access.
+                        if step.lines or step.channel_access:
+                            access = self._new_step()
+                            step.target = self._pc(access)
+                            step = access
+                    step = self._access(instance, step, op)
                 elif name == "func.call":
                     step = self._call(instance, step, op)
                 elif name == "func.return":
@@ -505,11 +508,6 @@ class ActorLowerer:
                     self.uses_float |= name in ("arith.addf", "arith.mulf")
                     self._write(step, self._reg(instance, op.results[0]), expression)
 
-                # Bound the amount of combinational work in an execution step.
-                if len(step.lines) >= 80 and not step.target:
-                    continuation = self._new_step()
-                    step.target = self._pc(continuation)
-                    step = continuation
             if not step.target:
                 fail(operations[-1], "Unterminated actor control-flow block")
         self._compiling.pop()
@@ -518,7 +516,8 @@ class ActorLowerer:
         typ = f"{self.symbol}State"
         pc = self._pc_type
         state = [reg for reg in self._fields if reg.persistent]
-        lines = [f"type {pc} = uN[{max(1, (len(self._steps) - 1).bit_length())}];",
+        pc_bits = f"uN[{max(1, (len(self._steps) - 1).bit_length())}]"
+        lines = [f"type {pc} = {pc_bits};",
                  f"struct {typ} {{", f"  pc: {pc},"]
         lines.extend(f"  {reg.name}: {reg.type}," for reg in state)
         lines += ["}", f"proc {self.symbol} {{"]
@@ -556,7 +555,7 @@ class ActorLowerer:
             lines.append(f"    let _ = send_if(join(), {name}, {predicate}, {data});")
         lines += [f"    {typ} {{", "      pc: match state.pc {"]
         for step in self._steps:
-            lines.append(f"        {self._pc(step)} => {step.target},")
+            lines.append(f"        {pc_bits}:{step.number} => {step.target},")
         lines += ["        _ => state.pc,", "      },"]
         writes = defaultdict(list)
         for step in self._steps:
@@ -566,7 +565,7 @@ class ActorLowerer:
         for reg in state:
             lines.append(f"      {reg.name}: match state.pc {{")
             for step, value in writes[reg]:
-                lines.append(f"        {self._pc(step)} => {value},")
+                lines.append(f"        {pc_bits}:{step.number} => {value},")
             lines += [f"        _ => state.{reg.name},", "      },"]
         lines += ["    }", "  }", "}"]
         return "\n".join(lines) + "\n"
