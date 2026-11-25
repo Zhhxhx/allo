@@ -105,6 +105,15 @@ def test_named_top_emits_only_its_call_closure(parse_mlir):
         ),
         (
             """
+            func.func @kernel() {
+              %x = memref.alloc() {static} : memref<i16>
+              return
+            }
+            """,
+            "@kernel: memref.alloc.*persistent storage requires an effectful interface",
+        ),
+        (
+            """
             func.func @kernel(%x: i8) -> i8 {
               %r = func.call @kernel(%x) : (i8) -> i8
               return %r : i8
@@ -151,3 +160,75 @@ def test_explicit_loop_and_if_values(parse_mlir):
     assert "* s64:2" in result
     assert "}(arg0);" in result
     assert "if arg1" in result
+
+
+def test_rejects_writes_to_an_argument_through_a_helper(parse_mlir):
+    module = parse_mlir(
+        """
+        module {
+          func.func @write(%x: memref<2xi8>, %value: i8) {
+            affine.store %value, %x[0] : memref<2xi8>
+            return
+          }
+          func.func @main(%a: memref<2xi8>, %value: i8) {
+            func.call @write(%a, %value) : (memref<2xi8>, i8) -> ()
+            return
+          }
+        }
+        """
+    )
+    with pytest.raises(
+        DslxFunctionError, match="@write: affine.store.*memref arguments"
+    ):
+        lower_functions(module, "main")
+
+
+def test_rejects_memref_alias_return_from_helper(parse_mlir):
+    module = parse_mlir(
+        """
+        module {
+          func.func @alias(%x: memref<2xi8>) -> memref<2xi8> {
+            return %x : memref<2xi8>
+          }
+          func.func @main(%a: memref<2xi8>) -> i8 {
+            %alias = func.call @alias(%a) : (memref<2xi8>) -> memref<2xi8>
+            %r = affine.load %alias[1] : memref<2xi8>
+            return %r : i8
+          }
+        }
+        """
+    )
+    with pytest.raises(DslxFunctionError, match="@main: func.call.*memref aliases"):
+        lower_functions(module, "main")
+
+
+def test_function_cli_resolves_top_and_preserves_single_entry(tmp_path, capsys):
+    from allo.backend.dslx.scripts.mlir_to_dslx_fn import main
+
+    source = tmp_path / "input.mlir"
+    source.write_text("module { func.func @single(%a: i8) -> i8 { return %a : i8 } }")
+    assert main([str(source)]) == 0
+    assert "fn single(arg0: u8) -> u8" in capsys.readouterr().out
+
+    source.write_text(
+        """
+        module {
+          func.func @unused(%a: f64) -> f64 { return %a : f64 }
+          func.func @helper(%a: i8) -> i8 { return %a : i8 }
+          func.func @top(%a: i8) -> i8 {
+            %value = func.call @helper(%a) : (i8) -> i8
+            return %value : i8
+          }
+        }
+        """
+    )
+    assert main([str(source)]) == 1
+    error = capsys.readouterr().err
+    assert "Select an entry with --top NAME" in error
+    assert "unused, helper, top" in error
+    output = tmp_path / "output"
+    assert main([str(source), "--top", "top", "-o", str(output)]) == 0
+    generated = (output / "input.x").read_text()
+    assert "fn top(arg0: u8)" in generated
+    assert "fn helper(arg0: u8)" in generated
+    assert "unused" not in generated

@@ -268,6 +268,8 @@ class MlirToDslxLowerer:
     def lower_op(self, op):
         name = op.operation.name
         if name in {"memref.alloc", "memref.alloca"}:
+            if "static" in op.attributes:
+                raise ValueError("persistent storage requires an effectful interface")
             val = op.results[0]
             typ = ir.MemRefType(val.type)
             annotation = dslx_type(typ)
