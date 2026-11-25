@@ -183,7 +183,7 @@ class StraightLineActorLowerer:
                 fail(op, "Unsupported straight-line actor operation")
         fail(function, "Missing straight-line actor return")
 
-    def lower(self):
+    def lower(self, *, include_helpers=True):
         self._reset()
         if len(self.function.body.blocks) != 1:
             fail(
@@ -213,13 +213,13 @@ class StraightLineActorLowerer:
         for cell in outputs:
             if cell.value is None:
                 fail(self.function, f"Output '{cell.port_name}' is never written")
-        return self._render(outputs)
+        return self._render(outputs, include_helpers=include_helpers)
 
-    def _render(self, outputs):
+    def _render(self, outputs, *, include_helpers):
         state_type = f"{self.symbol}State" if self._globals_initial else "()"
         ports = [f"{cell.port_name}: chan<{cell.typ}> out" for cell in outputs]
         lines = []
-        if self.uses_float:
+        if include_helpers and self.uses_float:
             lines.append(FP32_DSLX)
         if self._globals_initial:
             lines.append(f"struct {state_type} {{")
