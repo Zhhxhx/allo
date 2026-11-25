@@ -6,7 +6,6 @@
 from math import prod
 
 from allo._mlir import ir
-from allo._mlir import ir
 from allo._mlir.dialects import func as func_d
 
 
@@ -80,9 +79,7 @@ def _channel_function(module, top):
     return "\n".join(lines)
 
 
-def emit_proc_module(module, top):
-    from .mlir_to_dslx_proc import lower_legacy_proc
-
+def emit_proc_module(module, top, *, legacy_lowerer):
     if (
         "dataflow" in top.attributes
         and not top.type.results
@@ -120,4 +117,4 @@ def emit_proc_module(module, top):
 
         graph = build_actor(module, top.name.value)
         return graph.source, graph
-    return lower_legacy_proc(module, top.name.value), None
+    return legacy_lowerer(module, top.name.value), None

@@ -4,6 +4,7 @@
 """Lower straight-line sampling actors directly to one XLS proc tick."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 from allo._mlir import ir
 from allo._mlir.dialects import func as func_d
@@ -17,8 +18,8 @@ from .scalar import scalar_type
 @dataclass(eq=False)
 class _Cell:
     typ: str
-    value: str | None = None
-    port_name: str | None = None
+    value: Optional[str] = None
+    port_name: Optional[str] = None
 
 
 class StraightLineActorLowerer:

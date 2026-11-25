@@ -745,8 +745,10 @@ def lower_legacy_proc(module: Module, top_func_name: str) -> str:
     clean_mlir(module)
     return MlirToDslxProcLowerer(module, top_func_name).emit_module()
 
+
 def lower_mlir_to_proc(module: Module, top_func_name: str) -> str:
-    from ..dslx import extract_func_op
+    from .mlir_to_dslx_fn import extract_func_op
     from .proc_dispatch import emit_proc_module
 
-    return emit_proc_module(module, extract_func_op(module, top_func_name))[0]
+    top = extract_func_op(module, top_func_name)
+    return emit_proc_module(module, top, legacy_lowerer=lower_legacy_proc)[0]

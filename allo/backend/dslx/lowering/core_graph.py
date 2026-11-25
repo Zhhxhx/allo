@@ -95,8 +95,8 @@ def _external_wires(top):
 def _emit_actor(module, function, symbol, ports):
     arguments = module, function, symbol, ports
     try:
-        lowerer = StraightLineActorLowerer(*arguments)
-        return lowerer, lowerer.lower(include_helpers=False)
+        sampling_actor = StraightLineActorLowerer(*arguments)
+        return sampling_actor, sampling_actor.lower(include_helpers=False)
     except NotImplementedError:
         lowerer = ActorLowerer(*arguments)
         return lowerer, lowerer.lower()
@@ -152,7 +152,7 @@ def build_network(module, top_name):
     float_needed = False
     for op in top.entry_block.operations:
         kind = op.operation.name
-        if kind in ("memref.alloc", "memref.alloca"):
+        if kind in {"memref.alloc", "memref.alloca"}:
             nets[op.result] = _wire(op.result.type, f"fifo{len(nets)}")
         elif kind == "func.call":
             callee = op.callee.value

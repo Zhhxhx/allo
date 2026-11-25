@@ -116,7 +116,7 @@ def scalar_expression(op, value):
         if ir.MemRefType.isinstance(op.results[0].type):
             return None
         scalar_type(op.results[0].type)
-        cond, lhs, rhs = map(value, op.operands)
+        cond, lhs, rhs = (value(operand) for operand in op.operands)
         return f"if {cond} {{ {lhs} }} else {{ {rhs} }}"
     if kind in {"addf", "subf", "mulf", "negf", "cmpf"}:
         scalar_type(op.operands[0].type)
@@ -163,7 +163,7 @@ def scalar_expression(op, value):
         }:
             return None
 
-    lhs, rhs = map(value, op.operands)
+    lhs, rhs = (value(operand) for operand in op.operands)
     operand_type = op.operands[0].type
     result_type = scalar_type(op.results[0].type)
     if kind == "cmpi":

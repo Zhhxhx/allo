@@ -400,14 +400,15 @@ class MlirToDslxLowerer:
     def lower_for(self, op):
         results = list(op.results)
         self.check_region_results(results)
+        operands = list(op.operands)
         if op.operation.name == "affine.for":
             lower = _affine_bound(op.attributes["lowerBoundMap"], max)
             upper = _affine_bound(op.attributes["upperBoundMap"], min)
             step = ir.IntegerAttr(op.attributes["step"]).value
-            inputs = list(op.operands)
+            inputs = operands
         else:
-            lower, upper, step = map(_constant_bound, list(op.operands)[:3])
-            inputs = list(op.operands)[3:]
+            lower, upper, step = (_constant_bound(value) for value in operands[:3])
+            inputs = operands[3:]
         if step <= 0:
             raise ValueError("expected a positive loop step")
         remaining = max(0, upper - lower)
@@ -462,6 +463,13 @@ class MlirToDslxLowerer:
         args = ", ".join(self.value(arg) for arg in op.operands)
         packed = self.assign(f"{self.symbols[callee]}({args})")
         self.rebind(results, [], packed)
+
+
+def extract_func_op(module, name=None):
+    for op in module.body.operations:
+        if isinstance(op, func_d.FuncOp) and (name is None or op.name.value == name):
+            return op
+    raise ValueError(f"no MLIR function named {name!r}")
 
 
 def _function_table(ops):

@@ -5,7 +5,9 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import partial
 from math import prod
+from typing import NoReturn, Optional, Union
 
 from allo._mlir import ir
 from allo._mlir.passmanager import PassManager
@@ -35,7 +37,7 @@ class ActorRAM:
     name: str
     width: int
     size: int
-    initial: int | tuple[int, ...]
+    initial: Union[int, tuple[int, ...]]
     is_static: bool = False
 
     @property
@@ -63,9 +65,9 @@ class StateField:
 class Storage:
     shape: tuple[int, ...]
     element_type: str
-    state: StateField | None = None
-    port: int | None = None
-    ram: ActorRAM | None = None
+    state: Optional[StateField] = None
+    port: Optional[int] = None
+    ram: Optional[ActorRAM] = None
 
 
 @dataclass(eq=False)
@@ -92,7 +94,7 @@ class FunctionInstance:
     memories: dict[ir.Value, Storage] = field(default_factory=dict)
 
 
-def fail(op, message):
+def fail(op, message) -> NoReturn:
     raise NotImplementedError(f"{op.operation.name} at {op.location}: {message}")
 
 
@@ -131,7 +133,7 @@ def tuple_expr(values):
 
 def bit_expression(op, value):
     name = op.operation.name
-    if name not in ("allo.get_bit", "allo.get_slice", "allo.set_bit", "allo.set_slice"):
+    if name not in {"allo.get_bit", "allo.get_slice", "allo.set_bit", "allo.set_slice"}:
         return None
     operands = list(op.operands)
     data = value(operands[0])
@@ -318,7 +320,7 @@ class ActorLowerer:
         for block in blocks:
             for op in block.operations:
                 name = op.operation.name
-                if name in ("memref.alloc", "memref.alloca"):
+                if name in {"memref.alloc", "memref.alloca"}:
                     if len(op.operands):
                         fail(op, "Actor allocation requires a static identity binding")
                     instance.memories[op.results[0]] = self._storage(op.results[0].type)
@@ -507,14 +509,14 @@ class ActorLowerer:
             operations = list(block.operations)
             for op in operations:
                 name = op.operation.name
-                if name in (
+                if name in {
                     "memref.alloc",
                     "memref.alloca",
                     "memref.get_global",
                     "memref.dealloc",
-                ):
+                }:
                     continue
-                if name in ("memref.load", "memref.store"):
+                if name in {"memref.load", "memref.store"}:
                     memref = op.operands[0 if name == "memref.load" else 1]
                     storage = instance.memories.get(memref)
                     if storage and (storage.port is not None or storage.ram):
@@ -540,7 +542,7 @@ class ActorLowerer:
                         ):
                             self._write(step, reg, self._value(instance, step, value))
                         step.target = self._read(step, instance.return_pc)
-                elif name in ("cf.br", "cf.cond_br"):
+                elif name in {"cf.br", "cf.cond_br"}:
                     cond = (
                         self._value(instance, step, op.operands[0])
                         if name == "cf.cond_br"
@@ -553,15 +555,13 @@ class ActorLowerer:
                     if name == "arith.constant" and constant(op.results[0]) is not None:
                         continue
 
-                    def value(operand):
-                        return self._value(instance, step, operand)
-
+                    value = partial(self._value, instance, step)
                     expression = bit_expression(op, value)
                     if expression is None:
                         expression = scalar_expression(op, value)
                     if expression is None:
                         fail(op, "Unsupported scalar actor operation")
-                    self.uses_float |= name in ("arith.addf", "arith.mulf")
+                    self.uses_float |= name in {"arith.addf", "arith.mulf"}
                     self._write(step, self._reg(instance, op.results[0]), expression)
 
             if not step.target:

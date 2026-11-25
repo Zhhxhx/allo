@@ -9,4 +9,3 @@ if [[ -n "${XLS_BIN:-}" ]]; then
 fi
 export ALLO_DSLX_RTL_REQUIRED=1
 exec "${PYTHON:-python}" -m pytest tests/test_dslx*.py tests/test_xls.py "$@"
-
