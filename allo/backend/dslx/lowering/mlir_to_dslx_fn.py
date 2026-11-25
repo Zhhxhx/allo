@@ -1,515 +1,515 @@
-"""MLIR to DSLX function lowering implementation."""
+"""Lower pure MLIR functions to DSLX with explicit SSA and local buffer state."""
 
-from allo._mlir.ir import Operation, MemRefType
-from allo._mlir.ir import IntegerAttr, FloatAttr, DenseElementsAttr
-from allo._mlir.dialects import affine as affine_d
+import re
+
+from allo._mlir import ir
 from allo._mlir.dialects import func as func_d
-from allo._mlir.dialects import arith as arith_d
-from allo._mlir.dialects import linalg as linalg_d
-from allo._mlir.dialects import memref as memref_d
 
-from .shared.codegen_context import CodegenContext
-from .shared.dslx_nodes import (
-    DslxVar, DslxConst, DslxBinOp, DslxLoad, DslxStore,
-    DslxFor, DslxLet, DslxArrayInit
-)
+from .float32 import FP32_DSLX
+from .scalar import scalar_expression, scalar_type
+
+
+_DSLX_RESERVED = {
+    "as",
+    "const",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "let",
+    "match",
+    "proc",
+    "pub",
+    "struct",
+    "true",
+    "type",
+    "unroll_for",
+    "use",
+    "uN",
+    "sN",
+    "bits",
+    "bool",
+    "token",
+    "chan",
+    "config",
+    "init",
+    "next",
+    "spawn",
+    "clz",
+    "range",
+    "update",
+}
+_STORE = {"affine.store", "memref.store"}
+_LOAD = {"affine.load", "memref.load"}
+_YIELD = {"affine.yield", "scf.yield"}
+
+
+class DslxFunctionError(ValueError):
+    """A function or operation cannot be represented by the pure DSLX backend."""
+
+
+def function_name(name):
+    """Keep ordinary function names and encode reserved or non-DSLX symbols."""
+    if (
+        re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", name)
+        and name not in _DSLX_RESERVED
+        and not re.fullmatch(r"[us][0-9]+", name)
+        and not name.startswith("__allo_")
+    ):
+        return name
+    return f"__allo_fn_{name.encode().hex()}"
+
+
+def dslx_type(typ):
+    """Map a scalar or a statically shaped, ordinary memref to a DSLX value."""
+    if not ir.MemRefType.isinstance(typ):
+        return scalar_type(typ)
+    memref = ir.MemRefType(typ)
+    if memref.memory_space is not None:
+        raise ValueError(f"unsupported memory space in {memref}")
+    layout = memref.layout
+    identity = ir.AffineMap.get_identity(memref.rank, context=typ.context)
+    if (
+        not ir.AffineMapAttr.isinstance(layout)
+        or ir.AffineMapAttr(layout).value != identity
+    ):
+        raise ValueError(f"unsupported memref layout in {memref}")
+    if any(dim < 1 for dim in memref.shape):
+        raise ValueError(f"expected a nonempty, static memref shape in {memref}")
+    return scalar_type(memref.element_type) + "".join(
+        f"[{size}]" for size in reversed(memref.shape)
+    )
+
+
+def _walk(ops):
+    for op in ops:
+        yield op
+        for region in op.regions:
+            for block in region.blocks:
+                yield from _walk(block.operations)
+
+
+def _tuple(values):
+    values = list(values)
+    if len(values) == 1:
+        return values[0]
+    return f"({', '.join(values)})"
+
+
+def _floor_div(lhs, rhs):
+    return f"(({lhs} / {rhs}) - (({lhs} % {rhs} < s64:0) as s64))"
+
+
+def _affine_expr(expr, dimensions, symbols):
+    if ir.AffineDimExpr.isinstance(expr):
+        return dimensions[ir.AffineDimExpr(expr).position]
+    if ir.AffineSymbolExpr.isinstance(expr):
+        return symbols[ir.AffineSymbolExpr(expr).position]
+    if ir.AffineConstantExpr.isinstance(expr):
+        return f"s64:{ir.AffineConstantExpr(expr).value}"
+    if not ir.AffineBinaryExpr.isinstance(expr):
+        raise ValueError(f"unsupported affine expression {expr}")
+    binary = ir.AffineBinaryExpr(expr)
+    lhs = _affine_expr(binary.lhs, dimensions, symbols)
+    rhs = _affine_expr(binary.rhs, dimensions, symbols)
+    if ir.AffineAddExpr.isinstance(expr):
+        return f"({lhs} + {rhs})"
+    if ir.AffineMulExpr.isinstance(expr):
+        return f"({lhs} * {rhs})"
+
+    # DSLX division truncates toward zero, whereas affine divisors are positive.
+    if ir.AffineFloorDivExpr.isinstance(expr):
+        return _floor_div(lhs, rhs)
+    if ir.AffineCeilDivExpr.isinstance(expr):
+        return f"(({lhs} / {rhs}) + (({lhs} % {rhs} > s64:0) as s64))"
+    if ir.AffineModExpr.isinstance(expr):
+        return f"({lhs} - ({_floor_div(lhs, rhs)} * {rhs}))"
+    raise ValueError(f"unsupported affine expression {expr}")
+
+
+def _constant_bound(value):
+    if not isinstance(value, ir.OpResult) or value.owner.name != "arith.constant":
+        raise ValueError("expected a statically bounded loop")
+    return ir.IntegerAttr(value.owner.attributes["value"]).value
+
+
+def _affine_bound(attr, combine):
+    values = []
+    for expr in ir.AffineMapAttr(attr).value.results:
+        if not ir.AffineConstantExpr.isinstance(expr):
+            raise ValueError("expected constant affine loop bounds")
+        values.append(ir.AffineConstantExpr(expr).value)
+    return combine(values)
 
 
 class MlirToDslxLowerer:
-    def __init__(self, func_op: func_d.FuncOp):
+    def __init__(self, func_op, *, symbols=None, emitted_name=None):
         self.func_op = func_op
-        self.ctx = CodegenContext()
+        self.name = func_op.name.value
+        self.emitted_name = emitted_name or function_name(self.name)
+        self.symbols = symbols
+
+    def error(self, op, message):
+        return DslxFunctionError(
+            f"DSLX function @{self.name}: {op.operation.name} at {op.location}: {message}"
+        )
 
     def lower(self):
-        params = []
-        # Get function name
-        func_name = "simple_add"  # default
-        if "sym_name" in self.func_op.attributes:
-            func_name = self.func_op.attributes["sym_name"].value
-        elif hasattr(self.func_op, "name") and self.func_op.name:
-            func_name = self.func_op.name.value if hasattr(self.func_op.name, "value") else str(self.func_op.name)
-        
-        # Get return type
-        return_type = None
-        if self.func_op.type.results:
-            ret_mlir_type = self.func_op.type.results[0]
-            if isinstance(ret_mlir_type, MemRefType):
-                shape = list(ret_mlir_type.shape)
-                return_type = "u32" + "".join(f"[{dim}]" for dim in shape)
-            else:
-                # Scalar return type
-                return_type = "u32"
-        
-        # Process arguments
-        for i, arg in enumerate(self.func_op.arguments):
-            if isinstance(arg.type, MemRefType):
+        """Emit this function and its reachable pure callees."""
+        parent = self.func_op.operation.parent
+        if parent is None:
+            return _lower_functions({self.name: self.func_op}, self.name)
+        return _lower_functions(
+            _function_table(parent.regions[0].blocks[0].operations), self.name
+        )
+
+    def _emit_function(self):
+        self.values = {}
+        self.buffers = {}
+        self.lines = []
+        self.indent = 0
+        self.serial = 0
+        self.argument_buffers = set()
+
+        if len(self.func_op.body.blocks) != 1:
+            raise self.error(self.func_op, "expected one defined entry block")
+        try:
+            arguments = self.func_op.body.blocks[0].arguments
+            params = []
+            for i, arg in enumerate(arguments):
                 name = f"arg{i}"
-                shape = list(arg.type.shape)
-                self.ctx.memref_shapes[name] = shape
-                self.ctx.bind(arg, DslxVar(name))
-                type_str = "u32" + "".join(f"[{dim}]" for dim in shape)
-                params.append((name, type_str))
+                params.append(f"{name}: {dslx_type(arg.type)}")
+                if ir.MemRefType.isinstance(arg.type):
+                    self.buffers[arg] = name
+                    self.argument_buffers.add(arg)
+                else:
+                    self.values[arg] = name
+            result_type = _tuple(dslx_type(typ) for typ in self.func_op.type.results)
+        except ValueError as exc:
+            raise self.error(self.func_op, str(exc)) from exc
+
+        self.line(f"fn {self.emitted_name}({', '.join(params)}) -> {result_type} {{")
+        self.indent = 1
+        values = self.block(self.func_op.body.blocks[0], {"func.return"})
+        self.line(_tuple(values))
+        self.indent = 0
+        self.line("}")
+        return "\n".join(self.lines)
+
+    def line(self, text):
+        self.lines.append("  " * self.indent + text)
+
+    def fresh(self):
+        # A value can be live in MLIR yet unused after buffer state is lowered.
+        self.serial += 1
+        return f"_v{self.serial}"
+
+    def assign(self, expression, typ=None):
+        name = self.fresh()
+        annotation = f": {typ}" if typ is not None else ""
+        self.line(f"let {name}{annotation} = {expression};")
+        return name
+
+    def value(self, val):
+        expr = (
+            self.buffers.get(val)
+            if ir.MemRefType.isinstance(val.type)
+            else self.values.get(val)
+        )
+        if expr is None:
+            raise ValueError(f"unbound or uninitialized value of type {val.type}")
+        return expr
+
+    def block(self, block, terminators):
+        for op in block.operations:
+            try:
+                if op.operation.name in terminators:
+                    return [self.value(val) for val in op.operands]
+                self.lower_op(op)
+            except DslxFunctionError:
+                raise
+            except ValueError as exc:
+                raise self.error(op, str(exc)) from exc
+        raise ValueError(
+            f"missing expected block terminator {', '.join(sorted(terminators))}"
+        )
+
+    def capture(self, region, bindings=(), carried=()):
+        old_lines, old_values, old_buffers = self.lines, self.values, self.buffers
+        self.lines, self.values, self.buffers = [], dict(old_values), dict(old_buffers)
+        self.values.update(bindings)
+        self.buffers.update(carried)
+        self.indent += 1
+        try:
+            if not region.blocks:
+                return [], [], self.buffers
+            if len(region.blocks) != 1:
+                raise ValueError("expected a single-block structured region")
+            yielded = self.block(region.blocks[0], _YIELD)
+            return self.lines, yielded, self.buffers
+        finally:
+            self.indent -= 1
+            self.lines, self.values, self.buffers = old_lines, old_values, old_buffers
+
+    def rebind(self, results, buffers, packed):
+        parts = (
+            [packed]
+            if len(results) + len(buffers) == 1
+            else [f"{packed}.{i}" for i in range(len(results) + len(buffers))]
+        )
+        self.values.update(zip(results, parts))
+        self.buffers.update(zip(buffers, parts[len(results) :]))
+
+    def lower_op(self, op):
+        name = op.operation.name
+        if name in {"memref.alloc", "memref.alloca"}:
+            val = op.results[0]
+            typ = ir.MemRefType(val.type)
+            annotation = dslx_type(typ)
+            if typ.rank:
+                # Fresh array elements are undefined in MLIR. Use zero bits as
+                # their concrete values until a store writes them.
+                self.buffers[val] = self.assign(
+                    self.fill(typ, f"{scalar_type(typ.element_type)}:0"), annotation
+                )
             else:
-                # Scalar argument
-                name = f"arg{i}"
-                self.ctx.bind(arg, DslxVar(name))
-                params.append((name, "u32"))
-
-        # Process all operations and track return value
-        return_value = None
-        for op in self.func_op.body.blocks[0].operations:
-            if isinstance(op, func_d.ReturnOp):
-                if op.operands:
-                    return_value = self.ctx.lookup(op.operands[0])
-                # Don't break - still process other ops if any
-                continue
-            self.lower_op(op)
-
-        # Determine return expression
-        if return_value:
-            return_expr = self.emit_expr(return_value)
-        elif self.ctx.result_buffer:
-            return_expr = self.ctx.result_buffer
-        elif self.ctx.memref_shapes:
-            return_expr = list(self.ctx.memref_shapes.keys())[-1]
-        else:
-            return_expr = "arg0"
-
-        return self.emit_dslx(func_name, params, return_expr, return_type)
-
-    def lower_op(self, op: Operation):
-        if isinstance(op, affine_d.AffineForOp):
+                self.buffers[val] = None
+            return
+        if name in _LOAD:
+            base = op.operands[0]
+            indexes = self.indexes(op, list(op.operands)[1:])
+            expr = self.value(base) + "".join(f"[{index}]" for index in indexes)
+            self.bind_result(op, expr)
+            return
+        if name in _STORE:
+            value, base, *indices = op.operands
+            self.check_store(base)
+            indexes = self.indexes(op, indices)
+            expr = self.value(value)
+            if indexes:
+                expr = self.update(self.value(base), indexes, expr)
+            self.buffers[base] = self.assign(expr)
+            return
+        if name == "linalg.fill":
+            if len(op.operands) != 2 or len(op.results):
+                raise ValueError("expected a buffer-form linalg.fill with one output")
+            value, base = op.operands
+            self.check_store(base)
+            self.buffers[base] = self.assign(
+                self.fill(ir.MemRefType(base.type), self.value(value)),
+                dslx_type(base.type),
+            )
+            return
+        if name == "affine.apply":
+            expressions = self.affine_map(op.attributes["map"], list(op.operands))
+            self.bind_result(op, expressions[0])
+            return
+        if name in {"affine.for", "scf.for"}:
             self.lower_for(op)
-        elif isinstance(op, affine_d.AffineLoadOp):
-            self.lower_load(op)
-        elif isinstance(op, affine_d.AffineStoreOp):
-            self.lower_store(op)
-        elif isinstance(op, affine_d.AffineApplyOp):
-            self.lower_affine_apply(op)
-        elif isinstance(op, arith_d.ConstantOp):
-            self.lower_constant(op)
-        elif isinstance(op, arith_d.AddIOp):
-            self.lower_add(op)
-        elif isinstance(op, arith_d.MulIOp):
-            self.lower_mul(op)
-        elif isinstance(op, arith_d.ExtSIOp):
-            self.lower_extsi(op)
-        elif isinstance(op, arith_d.ExtUIOp):
-            self.lower_extui(op)
-        elif isinstance(op, arith_d.TruncIOp):
-            self.lower_trunci(op)
-        elif isinstance(op, linalg_d.FillOp):
-            self.lower_fill(op)
-        elif isinstance(op, memref_d.AllocOp):
-            self.lower_alloc(op)
-        elif isinstance(op, affine_d.AffineYieldOp):
             return
-        elif isinstance(op, func_d.ReturnOp):
+        if name == "scf.if":
+            self.lower_if(op)
             return
-        else:
-            print("Warning: unhandled op", op.operation.name)
+        if name == "func.call":
+            self.lower_call(op)
+            return
+        expression = scalar_expression(op, self.value)
+        if expression is None:
+            raise ValueError("unsupported operation in a pure function")
+        self.bind_result(op, expression)
 
-    def lower_constant(self, op):
-        attr = op.value
-        if isinstance(attr, IntegerAttr) or isinstance(attr, FloatAttr):
-            raw = attr.value
-        elif isinstance(attr, DenseElementsAttr):
-            raw = list(attr)[0]
-        else:
-            raw = int(str(attr).split(":")[0])
+    def bind_result(self, op, expression):
+        result = op.results[0]
+        self.values[result] = self.assign(expression, dslx_type(result.type))
 
-        node = DslxConst(raw)
-        self.ctx.bind(op.result, node)
-
-    def lower_alloc(self, op: memref_d.AllocOp):
-        try:
-            name_attr = op.attributes['name']
-            buf_name = name_attr.value if hasattr(name_attr, "value") else str(name_attr).strip('"')
-        except (KeyError, AttributeError):
-            buf_name = "C"
-
-        memref_type = op.result.type
-        if isinstance(memref_type, MemRefType):
-            shape = list(memref_type.shape)
-            self.ctx.memref_shapes[buf_name] = shape
-
-        self.ctx.result_buffer = buf_name
-        self.ctx.bind(op.result, DslxVar(buf_name))
-
-    def lower_add(self, op: arith_d.AddIOp):
-        lhs = self.ctx.lookup(op.lhs)
-        rhs = self.ctx.lookup(op.rhs)
-        node = DslxBinOp("+", lhs, rhs)
-        self.ctx.bind(op.result, node)
-
-    def lower_mul(self, op: arith_d.MulIOp):
-        lhs = self.ctx.lookup(op.lhs)
-        rhs = self.ctx.lookup(op.rhs)
-        node = DslxBinOp("*", lhs, rhs)
-        self.ctx.bind(op.result, node)
-
-    def lower_extsi(self, op: arith_d.ExtSIOp):
-        operand = self.ctx.lookup(op.operands[0])
-        self.ctx.bind(op.result, operand)
-
-    def lower_extui(self, op: arith_d.ExtUIOp):
-        operand = self.ctx.lookup(op.operands[0])
-        self.ctx.bind(op.result, operand)
-
-    def lower_trunci(self, op: arith_d.TruncIOp):
-        operand = self.ctx.lookup(op.operands[0])
-        self.ctx.bind(op.result, operand)
-
-    def lower_affine_apply(self, op: affine_d.AffineApplyOp):
-        """Lower affine.apply operations by evaluating the affine expression."""
-        # Get the affine map
-        aff_map = op.map.value
-
-        # Get operands (the values being substituted into the affine expression)
-        operands = [self.ctx.lookup(operand) for operand in op.operands]
-
-        # Evaluate the affine expression (assuming single result)
-        if len(aff_map.results) != 1:
-            raise RuntimeError(f"Expected single result in affine map, got {len(aff_map.results)}")
-
-        expr = aff_map.results[0]
-        result_node = self._eval_affine_expr(expr, operands)
-
-        # Bind the result
-        self.ctx.bind(op.result, result_node)
-
-    def _eval_affine_expr(self, expr, operands):
-        """Recursively evaluate an affine expression tree.
-
-        Common pattern for split loops: d0 + d1 * factor
-        which means: inner + outer * factor
-        """
-        expr_str = str(expr).strip()
-
-        # Check if it's a dimension reference (d0, d1, etc.)
-        if expr_str.startswith('d') and len(expr_str) <= 3:
-            try:
-                dim_num = int(expr_str[1:])
-                if dim_num < len(operands):
-                    return operands[dim_num]
-            except (ValueError, IndexError):
-                pass
-
-        # Check if it's a constant
-        try:
-            const_val = int(expr_str)
-            return DslxConst(const_val)
-        except ValueError:
-            pass
-
-        # For common split pattern: "d0 + d1 * N"
-        # Parse the string representation as a fallback
-        if '+' in expr_str and '*' in expr_str:
-            # Pattern: d0 + d1 * factor
-            parts = expr_str.split('*')
-            if len(parts) == 2:
-                try:
-                    factor = int(parts[-1].strip().rstrip(')'))
-                    # Get the two operands (d0 and d1)
-                    if len(operands) >= 2:
-                        # Result: d0 + (d1 * factor)
-                        mul_node = DslxBinOp("*", operands[1], DslxConst(factor))
-                        return DslxBinOp("+", operands[0], mul_node)
-                except:
-                    pass
-
-        # Try using expression structure if available
-        if hasattr(expr, '__iter__') and not isinstance(expr, str):
-            try:
-                children = list(expr)
-                if len(children) >= 2:
-                    lhs = self._eval_affine_expr(children[0], operands)
-                    rhs = self._eval_affine_expr(children[1], operands)
-                    # Infer operation from string
-                    if '+' in expr_str and '*' not in expr_str.split('+')[0]:
-                        return DslxBinOp("+", lhs, rhs)
-                    elif '*' in expr_str:
-                        return DslxBinOp("*", lhs, rhs)
-            except:
-                pass
-
-        # Fallback for simple identity (single operand)
-        if len(operands) == 1:
-            return operands[0]
-
-        raise RuntimeError(f"Cannot evaluate affine expression: {expr_str}")
-
-    def lower_load(self, op: affine_d.AffineLoadOp):
-        base = op.memref
-
-        buf_node = self.ctx.lookup(base)
-        if not isinstance(buf_node, DslxVar):
-            raise RuntimeError(f"Unknown or non-buffer memref base: {base}")
-
-        memref_name = buf_node.name
-
-        idx = self.lower_affine_index(op.indices)
-        node = DslxLoad(memref_name, idx)
-        self.ctx.bind(op.result, node)
-
-    def lower_store(self, op: affine_d.AffineStoreOp):
-        base = op.memref
-
-        buf_node = self.ctx.lookup(base)
-        if not isinstance(buf_node, DslxVar):
-            raise RuntimeError(f"Unknown or non-buffer memref base in store: {base}")
-
-        memref_name = buf_node.name
-
-        idx = self.lower_affine_index(op.indices)
-        value = self.ctx.lookup(op.value)
-        store = DslxStore(memref_name, idx, value)
-        self.ctx.dslx_stmts.append(store)
-
-    def lower_fill(self, op: linalg_d.FillOp):
-        val = self.ctx.lookup(op.inputs[0])
-        out_base = op.outputs[0]
-
-        buf_node = self.ctx.lookup(out_base)
-        if not isinstance(buf_node, DslxVar):
-            raise RuntimeError(f"Unknown output buffer in fill: {out_base}")
-
-        memref_name = buf_node.name
-
-        if memref_name in self.ctx.memref_shapes:
-            shape = self.ctx.memref_shapes[memref_name]
-            init_expr = self._create_array_init(val, shape)
-            self.ctx.dslx_stmts.append(DslxLet(memref_name, init_expr))
-        else:
-            self.ctx.dslx_stmts.append(DslxLet(memref_name, val))
-
-    def _create_array_init(self, val, shape):
-        return DslxArrayInit(val, shape)
-
-    def lower_for(self, op: affine_d.AffineForOp):
-        def get_constant_bound(map_like):
-            amap = map_like.value
-            expr = amap.results[0]
-
-            if hasattr(expr, "value"):
-                return expr.value
-
-            expr_str = str(expr).strip()
-
-            if expr_str.isdigit():
-                return int(expr_str)
-
-            if expr_str.startswith("-") and expr_str[1:].isdigit():
-                return int(expr_str)
-
-            if isinstance(expr, int):
-                return expr
-
-            raise NotImplementedError(
-                f"Unsupported affine bound expr: {expr!r} (string form: {expr_str})"
+    def check_store(self, base):
+        if base in self.argument_buffers:
+            raise ValueError(
+                "writes to memref arguments require an effectful interface"
             )
+        if base not in self.buffers:
+            raise ValueError(f"unsupported store through an alias of type {base.type}")
 
-        lb = get_constant_bound(op.lowerBoundMap)
-        ub = get_constant_bound(op.upperBoundMap)
+    @staticmethod
+    def fill(typ, value):
+        for size in reversed(typ.shape):
+            value = f"[{value}, ...]" if size > 1 else f"[{value}]"
+        return value
 
-        try:
-            loop_name_attr = op.attributes.get('loop_name')
-            if loop_name_attr:
-                iter_name = str(loop_name_attr).strip('"')
-            else:
-                depth = len(self.ctx.loop_stack)
-                iter_name = chr(ord('i') + depth)
-        except:
-            depth = len(self.ctx.loop_stack)
-            iter_name = chr(ord('i') + depth) if depth < 26 else f"i{depth}"
+    def update(self, array, indices, value):
+        index, *remaining = indices
+        if remaining:
+            value = self.update(f"{array}[{index}]", remaining, value)
+        return f"update({array}, {index}, {value})"
 
-        self.ctx.bind(op.induction_variable, DslxVar(iter_name))
-        self.ctx.loop_stack.append(iter_name)
+    def affine_map(self, attr, operands):
+        amap = ir.AffineMapAttr(attr).value
+        values = [self.value(val) for val in operands]
+        return [
+            _affine_expr(expr, values[: amap.n_dims], values[amap.n_dims :])
+            for expr in amap.results
+        ]
 
-        body_nodes = []
-        old_stmts = self.ctx.dslx_stmts
-        self.ctx.dslx_stmts = body_nodes
-
-        for nested in op.body.operations:
-            self.lower_op(nested)
-
-        loop = DslxFor(iter_name, lb, ub, body_nodes)
-        self.ctx.dslx_stmts = old_stmts
-        self.ctx.dslx_stmts.append(loop)
-
-        self.ctx.loop_stack.pop()
-
-    def lower_affine_index(self, indices):
-        index_nodes = [self.ctx.lookup(idx) for idx in indices]
-        if len(index_nodes) == 1:
-            return index_nodes[0]
+    def indexes(self, op, operands):
+        if op.operation.name.startswith("affine."):
+            expressions = self.affine_map(op.attributes["map"], operands)
         else:
-            return index_nodes
+            expressions = [self.value(val) for val in operands]
+        return [f"({expr} as u64)" for expr in expressions]
 
-    def emit_dslx(self, func_name, params, return_expr, return_type=None):
-        out = ["", ""]
+    @staticmethod
+    def check_region_results(results):
+        if any(ir.MemRefType.isinstance(val.type) for val in results):
+            raise ValueError("memref aliases as call or region results are unsupported")
 
-        param_list = ", ".join(f"{name}: {typ}" for name, typ in params)
+    def lower_if(self, op):
+        results = list(op.results)
+        self.check_region_results(results)
+        then_lines, then_yield, then_buffers = self.capture(op.regions[0])
+        else_lines, else_yield, else_buffers = self.capture(op.regions[1])
+        buffers = [
+            val
+            for val in self.buffers
+            if then_buffers[val] != else_buffers[val]
+            and then_buffers[val] is not None
+            and else_buffers[val] is not None
+        ]
+        if not results and not buffers:
+            return
+        condition = self.value(op.operands[0])
+        packed = self.fresh()
+        self.line(f"let {packed} = if {condition} {{")
+        self.lines.extend(then_lines)
+        self.line("  " + _tuple(then_yield + [then_buffers[val] for val in buffers]))
+        self.line("} else {")
+        self.lines.extend(else_lines)
+        self.line("  " + _tuple(else_yield + [else_buffers[val] for val in buffers]))
+        self.line("};")
+        self.rebind(results, buffers, packed)
 
-        # Determine return type
-        if return_type:
-            ret_type = return_type
-        elif return_expr in self.ctx.memref_shapes:
-            shape = self.ctx.memref_shapes[return_expr]
-            ret_type = "u32" + "".join(f"[{dim}]" for dim in shape)
+    def lower_for(self, op):
+        results = list(op.results)
+        self.check_region_results(results)
+        if op.operation.name == "affine.for":
+            lower = _affine_bound(op.attributes["lowerBoundMap"], max)
+            upper = _affine_bound(op.attributes["upperBoundMap"], min)
+            step = ir.IntegerAttr(op.attributes["step"]).value
+            inputs = list(op.operands)
         else:
-            # Default to u32 for scalar
-            ret_type = "u32"
-
-        # Build function signature
-        if return_type:
-            sig = f"fn {func_name}({param_list}) -> {ret_type} {{"
-        else:
-            sig = f"fn {func_name}({param_list}) {{"
-
-        out.append(sig)
-
-        # Emit body statements
-        for stmt in self.ctx.dslx_stmts:
-            out.extend(self.emit_stmt(stmt, indent=1))
-
-        # Emit return expression
-        out.append(f"  {return_expr}")
-        out.append("}")
-
-        return "\n".join(out)
-
-    def emit_expr(self, node):
-        if isinstance(node, DslxConst):
-            return f"u32:{node.value}"
-        if isinstance(node, DslxVar):
-            return node.name
-        if isinstance(node, DslxBinOp):
-            return f"({self.emit_expr(node.lhs)} {node.op} {self.emit_expr(node.rhs)})"
-        if isinstance(node, DslxLoad):
-            # Check if this is a scalar (no index or empty index list)
-            is_scalar = (node.index_expr is None or 
-                        (isinstance(node.index_expr, list) and len(node.index_expr) == 0))
-            
-            if is_scalar:
-                # Scalar: just return the variable name
-                return node.buffer_name
-            elif isinstance(node.index_expr, list):
-                indices = "][".join(self.emit_expr(idx) for idx in node.index_expr)
-                return f"{node.buffer_name}[{indices}]"
-            else:
-                return f"{node.buffer_name}[{self.emit_expr(node.index_expr)}]"
-        if isinstance(node, DslxArrayInit):
-            if len(node.shape) == 0:
-                return self.emit_expr(node.elem_expr)
-            elif len(node.shape) == 1:
-                # 1D array: u32[N]:[elem, elem, ...]
-                elem_str = self.emit_expr(node.elem_expr)
-                elements = ", ".join([elem_str] * node.shape[0])
-                return f"u32[{node.shape[0]}]:[{elements}]"
-            elif len(node.shape) == 2:
-                # 2D array: u32[INNER][OUTER]:[[elem, ...], ...]
-                elem_str = self.emit_expr(node.elem_expr)
-                return f"u32[{node.shape[1]}][{node.shape[0]}]:[[{elem_str}, ...], ...]"
-            else:
-                return self.emit_expr(node.elem_expr)
-        if isinstance(node, str):
-            return node
-        else:
-            return f"/* Cannot emit expr for {type(node).__name__} */"
-
-    def emit_stmt(self, stmt, indent):
-        tab = "  " * indent
-        if isinstance(stmt, DslxLet):
-            return [f"{tab}let {stmt.name} = {self.emit_expr(stmt.expr)};"]
-        if isinstance(stmt, DslxStore):
-            val_expr = self.emit_expr(stmt.value_expr)
-            
-            # Check if this is a scalar accumulator (not in memref_shapes)
-            # For scalar accumulators in for loops, we just return the value directly
-            is_scalar = stmt.buffer_name not in self.ctx.memref_shapes
-            
-            # Check if index_expr is empty/None (scalar accumulator case)
-            has_index = stmt.index_expr is not None and (
-                (isinstance(stmt.index_expr, list) and len(stmt.index_expr) > 0) or
-                (not isinstance(stmt.index_expr, list))
+            lower, upper, step = map(_constant_bound, list(op.operands)[:3])
+            inputs = list(op.operands)[3:]
+        if step <= 0:
+            raise ValueError("expected a positive loop step")
+        remaining = max(0, upper - lower)
+        count = (remaining + step - 1) // step
+        if count >= 2**32:
+            raise ValueError("loop trip count is outside the supported u32 range")
+        if len(inputs) != len(results):
+            raise ValueError("unexpected loop operand segments")
+        if count == 0:
+            self.values.update(
+                (val, self.value(arg)) for val, arg in zip(results, inputs)
             )
-            
-            if is_scalar or not has_index:
-                # Scalar accumulator: just return the value (for loop will handle it)
-                return [f"{tab}{val_expr}"]
-            
-            # Array update: use update() function
-            if isinstance(stmt.index_expr, list):
-                if len(stmt.index_expr) == 2:
-                    i_expr = self.emit_expr(stmt.index_expr[0])
-                    j_expr = self.emit_expr(stmt.index_expr[1])
-                    update_expr = f"update({stmt.buffer_name}, {i_expr}, update({stmt.buffer_name}[{i_expr}], {j_expr}, {val_expr}))"
-                    return [f"{tab}{update_expr}"]
-                else:
-                    idx_expr = ", ".join(self.emit_expr(idx) for idx in stmt.index_expr)
-                    update_expr = f"update({stmt.buffer_name}, {idx_expr}, {val_expr})"
-                    return [f"{tab}{update_expr}"]
-            else:
-                idx_expr = self.emit_expr(stmt.index_expr)
-                update_expr = f"update({stmt.buffer_name}, {idx_expr}, {val_expr})"
-                return [f"{tab}{update_expr}"]
-        if isinstance(stmt, DslxFor):
-            stores = self._find_stores_in_body(stmt.body)
+            return
 
-            if stores:
-                accum_names = list(set(s.buffer_name for s in stores))
-                accum_tuple = "(" + ", ".join(accum_names) + ")" if len(accum_names) > 1 else accum_names[0]
+        body = op.regions[0].blocks[0]
+        stores = set()
+        for nested in _walk(body.operations):
+            if (
+                nested.operation.name in _STORE
+                or nested.operation.name == "linalg.fill"
+            ):
+                stores.add(nested.operands[1])
+        buffers = [val for val in self.buffers if val in stores]
+        # Every loop-carried buffer needs its value from before the first iteration.
+        initial = [self.value(val) for val in inputs + buffers]
+        inner = [self.fresh() for _ in initial]
+        iteration = self.fresh()
+        ivar = self.fresh()
+        bindings = [(body.arguments[0], ivar)]
+        bindings.extend(zip(list(body.arguments)[1:], inner[: len(inputs)]))
+        body_lines, yielded, final = self.capture(
+            op.regions[0], bindings, zip(buffers, inner[len(inputs) :])
+        )
+        if not initial:
+            return
+        packed = self.fresh()
+        self.line(
+            f"let {packed} = for ({iteration}, {_tuple(inner)}) in u32:0..u32:{count} {{"
+        )
+        self.line(f"  let {ivar} = s64:{lower} + ({iteration} as s64) * s64:{step};")
+        self.lines.extend(body_lines)
+        self.line("  " + _tuple(yielded + [final[val] for val in buffers]))
+        self.line(f"}}({_tuple(initial)});")
+        self.rebind(results, buffers, packed)
 
-                # Determine if this is a top-level for loop (needs 'let') or nested (no 'let')
-                # We check if indent > 1, which means we're inside another for loop
-                is_nested = indent > 1
+    def lower_call(self, op):
+        callee = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+        if callee not in self.symbols:
+            raise ValueError(f"missing callee @{callee}")
+        results = list(op.results)
+        self.check_region_results(results)
+        args = ", ".join(self.value(arg) for arg in op.operands)
+        packed = self.assign(f"{self.symbols[callee]}({args})")
+        self.rebind(results, [], packed)
 
-                if is_nested:
-                    # Nested for loop: no 'let', just the for expression
-                    out = [f"{tab}for ({stmt.iter_name}, {accum_tuple}) in u32:{stmt.lb}..u32:{stmt.ub} {{"]
-                else:
-                    # Top-level for loop: has 'let'
-                    out = [f"{tab}let {accum_tuple} = for ({stmt.iter_name}, {accum_tuple}) in u32:{stmt.lb}..u32:{stmt.ub} {{"]
 
-                # Emit body statements
-                # For scalar accumulators, the body should just return the expression
-                for b in stmt.body:
-                    body_lines = self.emit_stmt(b, indent + 1)
-                    out.extend(body_lines)
+def _function_table(ops):
+    return {op.name.value: op for op in ops if isinstance(op, func_d.FuncOp)}
 
-                # Determine initializer value
-                # For scalar accumulators, use u32:0, for arrays use the variable name
-                init_values = []
-                for accum_name in accum_names:
-                    if accum_name in self.ctx.memref_shapes:
-                        # Array: use variable name as initializer
-                        init_values.append(accum_name)
-                    else:
-                        # Scalar: use u32:0 as initializer
-                        init_values.append("u32:0")
-                
-                init_str = "(" + ", ".join(init_values) + ")" if len(init_values) > 1 else init_values[0]
 
-                # Add the accumulator initializer: }(init) or }(init);
-                if is_nested:
-                    out.append(f"{tab}}}({init_str})")
-                else:
-                    out.append(f"{tab}}}({init_str});")
-            else:
-                out = [f"{tab}for ({stmt.iter_name}, _) in u32:{stmt.lb}..u32:{stmt.ub} {{"]
-                for b in stmt.body:
-                    out.extend(self.emit_stmt(b, indent + 1))
-                out.append(f"{tab}  ()")
-                out.append(f"{tab}}};")
-            return out
-        return [f"{tab}"]
+def _lower_functions(functions, top_name, emitted_top_name=None):
+    if top_name not in functions:
+        raise DslxFunctionError(f"DSLX function @{top_name}: MLIR top symbol not found")
+    symbols = {name: function_name(name) for name in functions}
+    if emitted_top_name is not None:
+        symbols[top_name] = function_name(emitted_top_name)
+        if any(
+            name != top_name and symbol == symbols[top_name]
+            for name, symbol in symbols.items()
+        ):
+            raise DslxFunctionError(
+                f"DSLX function @{top_name}: emitted top symbol collides with a helper"
+            )
+    definitions = []
+    active = set()
+    emitted = set()
 
-    def _find_stores_in_body(self, body):
-        stores = []
-        for stmt in body:
-            if isinstance(stmt, DslxStore):
-                stores.append(stmt)
-            elif isinstance(stmt, DslxFor):
-                stores.extend(self._find_stores_in_body(stmt.body))
-        return stores
+    def visit(name):
+        if name in emitted:
+            return
+        active.add(name)
+        lowerer = MlirToDslxLowerer(
+            functions[name], symbols=symbols, emitted_name=symbols[name]
+        )
+        source = lowerer._emit_function()
+        for op in _walk(functions[name].body.blocks[0].operations):
+            if op.operation.name != "func.call":
+                continue
+            callee = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+            if callee in active:
+                raise lowerer.error(op, f"recursive call to @{callee} is unsupported")
+            if callee not in symbols:
+                raise lowerer.error(op, f"missing callee @{callee}")
+            visit(callee)
+        active.remove(name)
+        emitted.add(name)
+        definitions.append(source)
+
+    visit(top_name)
+    functions_source = "\n\n".join(definitions) + "\n"
+    if "__allo_fp32_" in functions_source:
+        return FP32_DSLX + "\n" + functions_source
+    return functions_source
+
+
+def lower_functions(module, top_name, *, emitted_top_name=None):
+    """Emit the selected function and its transitively called pure helpers."""
+    return _lower_functions(
+        _function_table(module.body.operations), top_name, emitted_top_name
+    )
