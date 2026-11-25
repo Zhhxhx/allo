@@ -133,7 +133,7 @@ def _affine_expr(expr, dimensions, symbols):
 
 
 def _constant_bound(value):
-    if not isinstance(value, ir.OpResult) or value.owner.name != "arith.constant":
+    if not ir.OpResult.isinstance(value) or value.owner.name != "arith.constant":
         raise ValueError("expected a statically bounded loop")
     return ir.IntegerAttr(value.owner.attributes["value"]).value
 
