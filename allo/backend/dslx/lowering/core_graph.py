@@ -212,9 +212,16 @@ def build_network(module, top_name):
                 raise ValueError(
                     f"expected a reader and a writer on {wire.names[0]}: {wire.uses}"
                 )
+            # A stored FIFO breaks combinational ready/valid cycles between actors.
+            depth = wire.depth
+            policy = (
+                f"depth={depth}, bypass={str(depth == 0).lower()}, "
+                f"register_push_outputs={str(depth > 0).lower()}, "
+                f"register_pop_outputs={str(depth >= 2).lower()}"
+            )
             for n in wire.names:
                 wires.append(
-                    f'    let ({n}_out, {n}_in) = chan<uN[{wire.width}], u32:{wire.depth}>("{n}");'
+                    f'    let ({n}_out, {n}_in) = #[channel({policy})] chan<uN[{wire.width}]>("{n}");'
                 )
                 fifos.append((n, wire.width, wire.depth))
     params = ", ".join(p.declaration for p in ports + ram_ports)
@@ -234,4 +241,6 @@ def build_network(module, top_name):
     source = "\n\n".join(
         ([FP32_DSLX] if float_needed else []) + list(sources.values()) + [topology]
     )
+    if fifos:
+        source = "#![feature(channel_attributes)]\n" + source
     return Network(source, ports, rams, actors, fifos, top_name, topology, sources)
