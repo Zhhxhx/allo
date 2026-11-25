@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Lower scheduled Allo dataflow actors to blocking XLS procs."""
 
 from collections import defaultdict
@@ -191,7 +194,7 @@ class ActorLowerer:
         return step
 
     def _temporary(self, step, expression, typ=None):
-        name = f"t{self._locals}"
+        name = f"_t{self._locals}"
         self._locals += 1
         annotation = f": {typ}" if typ else ""
         step.lines.append(f"let {name}{annotation} = {expression};")

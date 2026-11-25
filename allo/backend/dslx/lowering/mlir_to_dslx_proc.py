@@ -1,3 +1,6 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MLIR to DSLX proc lowering implementation.
 
 Lowers MLIR functions to DSLX proc definitions with channels and state.
@@ -729,7 +732,7 @@ def clean_mlir(module):
         PassManager.parse("builtin.module(canonicalize, sccp, cse, symbol-dce)").run(module.operation)
 
 
-def lower_mlir_to_proc(module: Module, top_func_name: str) -> str:
+def lower_legacy_proc(module: Module, top_func_name: str) -> str:
     """Lower MLIR module to DSLX proc code.
     
     Args:
@@ -741,3 +744,9 @@ def lower_mlir_to_proc(module: Module, top_func_name: str) -> str:
     """
     clean_mlir(module)
     return MlirToDslxProcLowerer(module, top_func_name).emit_module()
+
+def lower_mlir_to_proc(module: Module, top_func_name: str) -> str:
+    from ..dslx import extract_func_op
+    from .proc_dispatch import emit_proc_module
+
+    return emit_proc_module(module, extract_func_op(module, top_func_name))[0]
